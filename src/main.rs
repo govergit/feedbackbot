@@ -59,11 +59,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bot = Bot::new(&cfg.bot_token);
     if app.admin_group_id() != 0 {
-        if let Err(error) = handlers::ensure_help_topic(&bot, &app.db, app.admin_group_id()).await {
+        if let Err(error) = handlers::ensure_help_topic(&bot, &app, app.admin_group_id()).await {
             tracing::error!(%error, "could not create Help topic at startup");
         }
     }
     handlers::initialize_user_statuses(&bot, &app).await;
+    let help_bot = bot.clone();
+    let help_app = app.clone();
+    let help_group = app.admin_group_id.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let group_id = help_group.load(Ordering::Relaxed);
+            if group_id != 0 {
+                if let Err(error) = handlers::check_help_topic(&help_bot, &help_app, group_id).await
+                {
+                    tracing::warn!(group_id, %error, "could not restore Help topic");
+                }
+            }
+        }
+    });
     Dispatcher::builder(
         bot,
         dptree::entry()

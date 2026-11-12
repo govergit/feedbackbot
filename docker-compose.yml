@@ -1,8 +1,0 @@
-services:
-  bot:
-    build: .
-    env_file: .env
-    restart: unless-stopped
-    mem_limit: 64m
-    volumes:
-      - ./data:/app/data

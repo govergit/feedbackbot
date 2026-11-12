@@ -22,7 +22,12 @@ async fn collect_album(msg: &Message, app: &App) -> Vec<Message> {
         .unwrap_or_default()
 }
 
-pub async fn ensure_help_topic(
+pub async fn ensure_help_topic(bot: &Bot, app: &App, group_id: i64) -> ResponseResult<()> {
+    let _guard = app.topic_lock.lock().await;
+    ensure_help_topic_unlocked(bot, &app.db, group_id).await
+}
+
+async fn ensure_help_topic_unlocked(
     bot: &Bot,
     db: &sqlx::SqlitePool,
     group_id: i64,
@@ -46,44 +51,69 @@ pub async fn ensure_help_topic(
     } else {
         None
     };
-    let is_pinned = if same_group {
-        sqlx::query_scalar::<_, bool>("SELECT value='true' FROM settings WHERE key='help_pinned'")
-            .fetch_optional(db)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(false)
+    let mut thread_id = if same_group {
+        saved_thread.and_then(|value| value.parse::<i32>().ok())
     } else {
-        false
+        None
     };
-    if let (Some(thread), Some(_message)) = (saved_thread.as_ref(), saved_message.as_ref()) {
-        if same_group && is_pinned {
-            return Ok(());
+    if let (Some(thread), Some(message)) = (
+        thread_id,
+        saved_message
+            .as_ref()
+            .and_then(|value| value.parse::<i32>().ok()),
+    ) {
+        match bot
+            .pin_chat_message(ChatId(group_id), MessageId(message))
+            .await
+        {
+            Ok(_) => {
+                save_setting(db, "help_pinned", "true").await;
+                return Ok(());
+            }
+            Err(error) if is_missing_forum_target(&error.to_string()) => {
+                if is_missing_forum_thread(&error.to_string()) {
+                    thread_id = None;
+                }
+            }
+            Err(error) => return Err(error),
         }
-        let thread_id = thread.parse::<i32>().unwrap_or_default();
-        let message_id = _message.parse::<i32>().unwrap_or_default();
-        if message_id > 0 {
-            bot.pin_chat_message(ChatId(group_id), MessageId(message_id))
-                .await?;
-            save_setting(db, "help_pinned", "true").await;
-            tracing::info!(
-                group_id,
-                thread_id,
-                message_id,
-                "pinned Help command reference"
-            );
-            return Ok(());
+        if thread_id == Some(thread) {
+            match bot
+                .send_message(ChatId(group_id), help_reference())
+                .message_thread_id(ThreadId(MessageId(thread)))
+                .await
+            {
+                Ok(message) => {
+                    save_setting(db, "help_message_id", &message.id.0.to_string()).await;
+                    bot.pin_chat_message(ChatId(group_id), message.id).await?;
+                    save_setting(db, "help_pinned", "true").await;
+                    return Ok(());
+                }
+                Err(error) if is_missing_forum_thread(&error.to_string()) => {
+                    thread_id = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    } else if let Some(thread) = thread_id {
+        match bot
+            .send_message(ChatId(group_id), help_reference())
+            .message_thread_id(ThreadId(MessageId(thread)))
+            .await
+        {
+            Ok(message) => {
+                save_setting(db, "help_message_id", &message.id.0.to_string()).await;
+                bot.pin_chat_message(ChatId(group_id), message.id).await?;
+                save_setting(db, "help_pinned", "true").await;
+                return Ok(());
+            }
+            Err(error) if is_missing_forum_thread(&error.to_string()) => thread_id = None,
+            Err(error) => return Err(error),
         }
     }
 
-    let thread_id = if same_group {
-        saved_thread
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let thread_id = if thread_id > 0 {
-        thread_id
+    let thread_id = if let Some(thread) = thread_id {
+        thread
     } else {
         let topic = bot
             .create_forum_topic(ChatId(group_id), "Help", 0x6FB9F0, "")
@@ -93,7 +123,64 @@ pub async fn ensure_help_topic(
         save_setting(db, "help_thread_id", &new_id.to_string()).await;
         new_id
     };
-    let help = concat!(
+    let help = help_reference();
+    let message = bot
+        .send_message(ChatId(group_id), help)
+        .message_thread_id(ThreadId(MessageId(thread_id)))
+        .await?;
+    save_setting(db, "help_message_id", &message.id.0.to_string()).await;
+    bot.pin_chat_message(ChatId(group_id), message.id).await?;
+    save_setting(db, "help_pinned", "true").await;
+    tracing::info!(
+        group_id,
+        thread_id,
+        message_id = message.id.0,
+        "pinned Help command reference"
+    );
+    Ok(())
+}
+
+pub async fn check_help_topic(bot: &Bot, app: &App, group_id: i64) -> ResponseResult<()> {
+    let _guard = app.topic_lock.lock().await;
+    let db = &app.db;
+    let saved_group: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key='help_group_id'")
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
+    let saved_message: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key='help_message_id'")
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
+    let Some(message_id) = saved_message.and_then(|value| value.parse::<i32>().ok()) else {
+        return ensure_help_topic_unlocked(bot, db, group_id).await;
+    };
+    if saved_group.as_deref() != Some(&group_id.to_string()) {
+        return ensure_help_topic_unlocked(bot, db, group_id).await;
+    }
+    match bot
+        .edit_message_text(ChatId(group_id), MessageId(message_id), help_reference())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .to_string()
+                .to_lowercase()
+                .contains("message is not modified") =>
+        {
+            Ok(())
+        }
+        Err(error) if is_missing_forum_target(&error.to_string()) => {
+            ensure_help_topic_unlocked(bot, db, group_id).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn help_reference() -> String {
+    concat!(
         "СПРАВКА ПО БОТУ ПОДДЕРЖКИ\n\n",
         "НАСТРОЙКА ГРУППЫ\n",
         "/chatid — показать ID группы.\n",
@@ -110,27 +197,30 @@ pub async fn ensure_help_topic(
         "/stats — статистика; команда работает в General.\n\n",
         "СООБЩЕНИЯ\n",
         "Сообщения в топике отправляются пользователю. Текстовые правки синхронизируются в обе стороны. Сообщения с точкой или # в начале остаются внутренними комментариями менеджеров."
-    );
-    let message_id = if let Some(saved) = saved_message.and_then(|x| x.parse::<i32>().ok()) {
-        saved
-    } else {
-        let message = bot
-            .send_message(ChatId(group_id), help)
-            .message_thread_id(ThreadId(MessageId(thread_id)))
-            .await?;
-        save_setting(db, "help_message_id", &message.id.0.to_string()).await;
-        message.id.0
-    };
-    bot.pin_chat_message(ChatId(group_id), MessageId(message_id))
-        .await?;
-    save_setting(db, "help_pinned", "true").await;
-    tracing::info!(
-        group_id,
-        thread_id,
-        message_id,
-        "pinned Help command reference"
-    );
-    Ok(())
+    )
+    .to_string()
+}
+
+fn is_missing_forum_thread(error: &str) -> bool {
+    let error = error.to_lowercase().replace('_', " ");
+    error.contains("message thread not found")
+        || error.contains("thread not found")
+        || error.contains("topic not found")
+        || error.contains("topic deleted")
+        || error.contains("message thread invalid")
+}
+
+fn is_closed_forum_thread(error: &str) -> bool {
+    let error = error.to_lowercase().replace('_', " ");
+    error.contains("topic is closed") || error.contains("topic closed")
+}
+
+fn is_missing_forum_target(error: &str) -> bool {
+    let error = error.to_lowercase().replace('_', " ");
+    is_missing_forum_thread(&error)
+        || error.contains("message to pin not found")
+        || error.contains("message to edit not found")
+        || error.contains("message id invalid")
 }
 
 async fn save_setting(db: &sqlx::SqlitePool, key: &str, value: &str) {
@@ -177,8 +267,8 @@ impl TicketStatus {
             Self::Ready => "👋 <b>Служба поддержки готова</b>\nОтправьте сообщение, чтобы открыть обращение.",
             Self::Sending => "⏳ <b>Передаём сообщение команде поддержки</b>\nЭто обычно занимает несколько секунд.",
             Self::Waiting => "✅ <b>Сообщение доставлено специалистам</b>\n⏳ Обращение ожидает ответа. Ответ появится здесь, в этом чате.\n\nМожете отправить сюда дополнительные сведения или файлы — они попадут в это же обращение.",
-            Self::Answered => "✅ <b>Поддержка ответила</b>\nОтвет специалиста находится выше в этом чате. Если вопрос ещё не решён, просто ответьте новым сообщением.",
-            Self::Closed => "🔒 <b>Обращение закрыто</b>\nЕсли понадобится помощь по этому или другому вопросу, отправьте сообщение — мы откроем новое обращение.",
+            Self::Answered => "✅ <b>Поддержка ответила</b>\nОтвет специалиста находится ниже в этом чате. Если вопрос ещё не решён, просто ответьте новым сообщением.",
+            Self::Closed => "🔒 <b>Обращение закрыто</b>\nЕсли понадобится помощь, отправьте сообщение — тема обращения снова откроется.",
             Self::Banned => "⛔ <b>Доступ к поддержке ограничен</b>\nЕсли вы считаете, что это произошло по ошибке, свяжитесь с администратором поддержки.",
             Self::Unavailable => "⚙️ <b>Поддержка пока не подключена</b>\nВаше сообщение ещё не передано. Попробуйте написать позже.",
             Self::Failed => "⚠️ <b>Не удалось доставить сообщение</b>\nОно не попало специалистам. Попробуйте отправить его ещё раз чуть позже.",
@@ -335,7 +425,7 @@ async fn update_user_status_message(
     {
         tracing::error!(user_id = uid, %error, "could not persist user status");
     }
-    if force_new && is_pinned {
+    if is_pinned {
         if let Some(old_id) = old_message_id.filter(|old_id| *old_id != message_id) {
             if let Err(error) = bot.delete_message(ChatId(uid), MessageId(old_id)).await {
                 tracing::warn!(user_id = uid, old_message_id = old_id, %error, "could not delete previous pinned status message");
@@ -437,6 +527,9 @@ pub async fn private(bot: &Bot, msg: &Message, user: &User, app: &App) -> Respon
         }
     }
     let tid = ensure_topic(bot, msg, user, app).await?;
+    if tid <= 0 {
+        return Ok(());
+    }
     tracing::info!(
         user_id = uid,
         admin_group_id = app.admin_group_id(),
@@ -452,7 +545,7 @@ pub async fn private(bot: &Bot, msg: &Message, user: &User, app: &App) -> Respon
     if batch.len() > 1 {
         let ids = batch.iter().map(|m| m.id).collect::<Vec<_>>();
         match bot
-            .copy_messages(ChatId(app.admin_group_id()), msg.chat.id, ids)
+            .copy_messages(ChatId(app.admin_group_id()), msg.chat.id, ids.clone())
             .message_thread_id(ThreadId(MessageId(tid)))
             .await
         {
@@ -461,6 +554,43 @@ pub async fn private(bot: &Bot, msg: &Message, user: &User, app: &App) -> Respon
                     let _ = db::map_add(&app.db, uid, source.id.0, destination.0, "in").await;
                 }
                 update_user_status(bot, app, uid, TicketStatus::Waiting).await;
+            }
+            Err(error) if is_closed_forum_thread(&error.to_string()) => {
+                let _guard = app.topic_lock.lock().await;
+                match bot
+                    .reopen_forum_topic(ChatId(app.admin_group_id()), ThreadId(MessageId(tid)))
+                    .await
+                {
+                    Ok(_) => {
+                        sqlx::query("UPDATE users SET topic_closed=0 WHERE user_id=?")
+                            .bind(uid)
+                            .execute(&app.db)
+                            .await
+                            .ok();
+                        match bot
+                            .copy_messages(ChatId(app.admin_group_id()), msg.chat.id, ids)
+                            .message_thread_id(ThreadId(MessageId(tid)))
+                            .await
+                        {
+                            Ok(copied) => {
+                                for (source, destination) in batch.iter().zip(copied) {
+                                    let _ =
+                                        db::map_add(&app.db, uid, source.id.0, destination.0, "in")
+                                            .await;
+                                }
+                                update_user_status(bot, app, uid, TicketStatus::Waiting).await;
+                            }
+                            Err(error) => {
+                                tracing::error!(user_id = uid, forum_thread_id = tid, %error, "failed to copy album after reopening its topic");
+                                update_user_status(bot, app, uid, TicketStatus::Failed).await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(user_id = uid, forum_thread_id = tid, %error, "could not reopen closed support topic");
+                        update_user_status(bot, app, uid, TicketStatus::Failed).await;
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(%e, "failed to copy inbound album");
@@ -494,6 +624,41 @@ pub async fn private(bot: &Bot, msg: &Message, user: &User, app: &App) -> Respon
             let _ = db::map_add(&app.db, uid, msg.id.0, copied.0, "in").await;
             update_user_status(bot, app, uid, TicketStatus::Waiting).await;
         }
+        Err(error) if is_closed_forum_thread(&error.to_string()) => {
+            let _guard = app.topic_lock.lock().await;
+            match bot
+                .reopen_forum_topic(ChatId(app.admin_group_id()), ThreadId(MessageId(tid)))
+                .await
+            {
+                Ok(_) => {
+                    sqlx::query("UPDATE users SET topic_closed=0 WHERE user_id=?")
+                        .bind(uid)
+                        .execute(&app.db)
+                        .await
+                        .ok();
+                    let mut retry =
+                        bot.copy_message(ChatId(app.admin_group_id()), msg.chat.id, msg.id);
+                    retry = retry.message_thread_id(ThreadId(MessageId(tid)));
+                    if let Some(id) = reply {
+                        retry = retry.reply_parameters(ReplyParameters::new(MessageId(id)));
+                    }
+                    match retry.await {
+                        Ok(copied) => {
+                            let _ = db::map_add(&app.db, uid, msg.id.0, copied.0, "in").await;
+                            update_user_status(bot, app, uid, TicketStatus::Waiting).await;
+                        }
+                        Err(error) => {
+                            tracing::error!(user_id = uid, forum_thread_id = tid, %error, "failed to deliver message after reopening its topic");
+                            update_user_status(bot, app, uid, TicketStatus::Failed).await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(user_id = uid, forum_thread_id = tid, %error, "could not reopen closed support topic");
+                    update_user_status(bot, app, uid, TicketStatus::Failed).await;
+                }
+            }
+        }
         Err(e)
             if e.to_string().to_lowercase().contains("thread not found")
                 || e.to_string()
@@ -505,13 +670,16 @@ pub async fn private(bot: &Bot, msg: &Message, user: &User, app: &App) -> Respon
             let new_tid = if let Some(current_tid) = current_tid.filter(|id| *id != tid) {
                 current_tid
             } else {
-                sqlx::query("UPDATE users SET thread_id=NULL WHERE user_id=?")
+                sqlx::query("UPDATE users SET thread_id=NULL,dossier_msg_id=NULL,dossier_pinned=0,topic_closed=0,topic_creation_pending=0 WHERE user_id=?")
                     .bind(uid)
                     .execute(&app.db)
                     .await
                     .ok();
                 ensure_topic_unlocked(bot, msg, user, app).await?
             };
+            if new_tid <= 0 {
+                return Ok(());
+            }
             tracing::info!(
                 user_id = uid,
                 old_thread_id = tid,
@@ -588,14 +756,93 @@ async fn ensure_topic_unlocked(
     app: &App,
 ) -> ResponseResult<i32> {
     let uid = u.id.0 as i64;
-    if let Some(t) = db::thread(&app.db, uid).await {
-        tracing::info!(
+    let stored_thread =
+        sqlx::query_scalar::<_, Option<i32>>("SELECT thread_id FROM users WHERE user_id=?")
+            .bind(uid)
+            .fetch_optional(&app.db)
+            .await;
+    let existing = match stored_thread {
+        Ok(row) => row.flatten(),
+        Err(error) => {
+            tracing::error!(user_id = uid, %error, "failed to load topic mapping; refusing to create a duplicate");
+            update_user_status(bot, app, uid, TicketStatus::Failed).await;
+            return Ok(0);
+        }
+    };
+    if let Some(t) = existing {
+        let closed =
+            sqlx::query_scalar::<_, bool>("SELECT topic_closed FROM users WHERE user_id=?")
+                .bind(uid)
+                .fetch_one(&app.db)
+                .await
+                .unwrap_or(false);
+        if closed {
+            match bot.reopen_forum_topic(ChatId(app.admin_group_id()), ThreadId(MessageId(t))).await {
+                Ok(_) => {
+                    sqlx::query("UPDATE users SET topic_closed=0 WHERE user_id=?")
+                        .bind(uid)
+                        .execute(&app.db)
+                        .await
+                        .ok();
+                }
+                Err(error) if is_missing_forum_thread(&error.to_string()) => {
+                    if let Err(db_error) = sqlx::query("UPDATE users SET thread_id=NULL,dossier_msg_id=NULL,dossier_pinned=0,topic_closed=0 WHERE user_id=?")
+                        .bind(uid)
+                        .execute(&app.db)
+                        .await
+                    {
+                        tracing::error!(user_id = uid, %db_error, "deleted topic mapping could not be cleared; refusing to create a duplicate");
+                        return Ok(0);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(user_id = uid, forum_thread_id = t, %error, "could not reopen existing support topic; refusing to create a duplicate");
+                    return Ok(0);
+                }
+            }
+        }
+        if db::thread(&app.db, uid).await == Some(t) {
+            tracing::info!(
+                user_id = uid,
+                forum_thread_id = t,
+                "using existing support topic"
+            );
+            ensure_dossier(bot, u, app, t).await;
+            return Ok(t);
+        }
+    }
+    let pending = match sqlx::query_scalar::<_, bool>(
+        "SELECT topic_creation_pending FROM users WHERE user_id=?",
+    )
+    .bind(uid)
+    .fetch_one(&app.db)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(user_id = uid, %error, "failed to check topic creation state; refusing to create a duplicate");
+            return Ok(0);
+        }
+    };
+    if pending {
+        tracing::error!(
             user_id = uid,
-            forum_thread_id = t,
-            "using existing support topic"
+            "topic creation is pending; refusing to create a duplicate"
         );
-        ensure_dossier(bot, u, app, t).await;
-        return Ok(t);
+        let _ = bot.send_message(ChatId(uid), "Создание темы поддержки ещё не подтверждено. Я не буду создавать вторую тему автоматически. Администратору нужно проверить группу и журнал бота.").await;
+        return Ok(0);
+    }
+    let reserved = sqlx::query("UPDATE users SET topic_creation_pending=1 WHERE user_id=? AND thread_id IS NULL AND topic_creation_pending=0")
+        .bind(uid)
+        .execute(&app.db)
+        .await;
+    match reserved {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => return Ok(0),
+        Err(error) => {
+            tracing::error!(user_id = uid, %error, "could not reserve topic creation");
+            return Ok(0);
+        }
     }
     let mut name = format!(
         "{} (@{}) [{}]",
@@ -611,6 +858,16 @@ async fn ensure_topic_unlocked(
     {
         Ok(topic) => topic,
         Err(error) => {
+            if matches!(
+                &error,
+                teloxide::RequestError::Api(_) | teloxide::RequestError::RetryAfter(_)
+            ) {
+                sqlx::query("UPDATE users SET topic_creation_pending=0 WHERE user_id=?")
+                    .bind(uid)
+                    .execute(&app.db)
+                    .await
+                    .ok();
+            }
             tracing::error!(user_id = uid, admin_group_id = group_id, %error, "Telegram rejected forum topic creation");
             update_user_status(bot, app, uid, TicketStatus::Failed).await;
             let _ = bot
@@ -619,18 +876,24 @@ async fn ensure_topic_unlocked(
                     format!("Не удалось создать тему поддержки в группе. Проверьте, что Topics включены и у бота есть право «Управление темами». Ошибка Telegram: {error}"),
                 )
                 .await;
-            return Err(error);
+            return Ok(0);
         }
     };
     let id = topic.thread_id.0 .0;
-    if let Err(error) = db::set_thread(&app.db, uid, id).await {
+    if let Err(error) = sqlx::query("UPDATE users SET thread_id=?,topic_creation_pending=0,topic_closed=0 WHERE user_id=? AND thread_id IS NULL")
+        .bind(id)
+        .bind(uid)
+        .execute(&app.db)
+        .await
+    {
         tracing::error!(user_id = uid, forum_thread_id = id, %error, "failed to save support topic id");
         let _ = bot
             .send_message(
                 ChatId(uid),
-                format!("Тема создана, но не удалось сохранить её в базе данных: {error}"),
+                "Тема создана, но её привязка не сохранилась. Я не буду создавать копию автоматически; администратору нужно проверить группу и базу данных.",
             )
             .await;
+        return Ok(0);
     }
     tracing::info!(
         user_id = uid,
@@ -861,7 +1124,7 @@ pub async fn admin(bot: &Bot, msg: &Message, app: &App) -> ResponseResult<()> {
             return Ok(());
         }
         app.admin_group_id.store(msg.chat.id.0, Ordering::Relaxed);
-        if let Err(error) = ensure_help_topic(bot, &app.db, msg.chat.id.0).await {
+        if let Err(error) = ensure_help_topic(bot, app, msg.chat.id.0).await {
             tracing::error!(%error, "could not create Help topic");
             bot.send_message(
                 msg.chat.id,
@@ -1004,7 +1267,7 @@ async fn command(
     let chat = msg.chat.id;
     match cmd {
         "ban" => {
-            sqlx::query("UPDATE users SET is_banned=1 WHERE user_id=?")
+            sqlx::query("UPDATE users SET is_banned=1,topic_closed=1 WHERE user_id=?")
                 .bind(uid)
                 .execute(&app.db)
                 .await
@@ -1020,7 +1283,7 @@ async fn command(
             return Ok(true);
         }
         "unban" => {
-            sqlx::query("UPDATE users SET is_banned=0 WHERE user_id=?")
+            sqlx::query("UPDATE users SET is_banned=0,topic_closed=0 WHERE user_id=?")
                 .bind(uid)
                 .execute(&app.db)
                 .await
@@ -1042,13 +1305,11 @@ async fn command(
             bot.close_forum_topic(chat, ThreadId(MessageId(tid)))
                 .await
                 .ok();
-            sqlx::query(
-                "UPDATE users SET thread_id=NULL,dossier_msg_id=NULL,dossier_pinned=0 WHERE user_id=?",
-            )
-            .bind(uid)
-            .execute(&app.db)
-            .await
-            .ok();
+            sqlx::query("UPDATE users SET topic_closed=1 WHERE user_id=?")
+                .bind(uid)
+                .execute(&app.db)
+                .await
+                .ok();
             return Ok(true);
         }
         "note" => {

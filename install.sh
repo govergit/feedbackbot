@@ -7,6 +7,12 @@ if [ -z "$REPO" ]; then
   exit 1
 fi
 case "$REPO" in */*) ;; *) echo "BOT_REPO must be owner/repository" >&2; exit 1 ;; esac
+APP_DIR=${BOT_INSTALL_DIR:-/opt/tg-rust-support-bot}
+
+if [ -f "$APP_DIR/.env" ]; then
+  BOT_TOKEN=${BOT_TOKEN:-$(sed -n 's/^BOT_TOKEN=//p' "$APP_DIR/.env" | head -n 1)}
+  BOT_OWNER_ID=${BOT_OWNER_ID:-$(sed -n 's/^BOT_OWNER_ID=//p' "$APP_DIR/.env" | head -n 1)}
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root, for example: curl ... | sudo env BOT_REPO=$REPO sh" >&2
@@ -26,26 +32,85 @@ if [ -z "${BOT_OWNER_ID:-}" ]; then
   BOT_OWNER_ID=${BOT_OWNER_ID:-8883130864}
 fi
 case "$BOT_OWNER_ID" in ''|*[!0-9]*) echo "BOT_OWNER_ID must be numeric" >&2; exit 1 ;; esac
-ARCH=$(uname -m)
-if [ "$ARCH" != x86_64 ]; then
-  echo "No standalone binary is published for $ARCH yet. Use Docker Compose on this architecture." >&2
+
+IMAGE="localhost/tg-rust-support-bot:installed"
+mkdir -p "$APP_DIR/data"
+
+ENGINE=
+if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+  ENGINE=$(command -v podman)
+elif command -v docker >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  fi
+  if docker info >/dev/null 2>&1; then
+    ENGINE=$(command -v docker)
+  fi
+fi
+
+if [ -z "$ENGINE" ]; then
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+  fi
+  case "${ID:-}:${ID_LIKE:-}" in
+    ubuntu:*|debian:*|*:debian*)
+      apt-get update
+      apt-get install -y podman curl ca-certificates
+      ;;
+    fedora:*|rhel:*|centos:*|rocky:*|almalinux:*|*:fedora*|*:rhel*)
+      if command -v dnf >/dev/null 2>&1; then
+        dnf install -y podman curl ca-certificates
+      else
+        yum install -y podman curl ca-certificates
+      fi
+      ;;
+    opensuse*:*|sles:*|*:suse*)
+      zypper --non-interactive install podman curl ca-certificates
+      ;;
+    alpine:*)
+      apk add --no-cache podman curl ca-certificates
+      ;;
+    *)
+      echo "Unsupported Linux distribution. Install Podman or Docker, then rerun this command." >&2
+      exit 1
+      ;;
+  esac
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    ENGINE=$(command -v podman)
+  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    ENGINE=$(command -v docker)
+  else
+    echo "Podman was installed but could not start. Install Docker or check the host service." >&2
+    exit 1
+  fi
+fi
+
+if [ "$(uname -m)" != x86_64 ]; then
+  echo "The ready-to-install release binary is currently published for x86_64 Linux." >&2
   exit 1
 fi
 
-APP_DIR=${BOT_INSTALL_DIR:-/opt/tg-rust-support-bot}
 ASSET=tg-rust-support-bot-linux-x86_64
-mkdir -p "$APP_DIR/data"
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+mkdir -p "$APP_DIR/image"
 if command -v curl >/dev/null 2>&1; then
-  curl -fL "$DOWNLOAD_URL" -o "$APP_DIR/bot.new"
+  curl -fL "$DOWNLOAD_URL" -o "$APP_DIR/image/bot"
 elif command -v wget >/dev/null 2>&1; then
-  wget -O "$APP_DIR/bot.new" "$DOWNLOAD_URL"
+  wget -O "$APP_DIR/image/bot" "$DOWNLOAD_URL"
 else
-  echo "Install curl or wget first." >&2
+  echo "Install curl or wget to download the release binary." >&2
   exit 1
 fi
-chmod 755 "$APP_DIR/bot.new"
-mv "$APP_DIR/bot.new" "$APP_DIR/bot"
+chmod 755 "$APP_DIR/image/bot"
+cat > "$APP_DIR/image/Dockerfile" <<'DOCKERFILE'
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates && addgroup -S -g 10001 bot && adduser -S -D -H -u 10001 -G bot bot
+WORKDIR /app
+COPY bot /usr/local/bin/bot
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/bot"]
+DOCKERFILE
+"$ENGINE" build -t "$IMAGE" "$APP_DIR/image"
 
 if [ ! -f "$APP_DIR/.env" ]; then
   umask 077
@@ -53,7 +118,7 @@ if [ ! -f "$APP_DIR/.env" ]; then
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_GROUP_ID=
 BOT_OWNER_ID=$BOT_OWNER_ID
-DATABASE_URL=sqlite://$APP_DIR/data/bot.db?mode=rwc
+DATABASE_URL=sqlite:///app/data/bot.db?mode=rwc
 RATE_LIMIT_MAX_MSG=5
 RATE_LIMIT_WINDOW_SEC=10
 CAPTCHA_ENABLED=true
@@ -64,38 +129,39 @@ OUT_OF_HOURS_TEXT=Мы ответим вам в ближайшее рабоче�
 ENV
 fi
 
-RUN_USER=root
-if command -v useradd >/dev/null 2>&1; then
-  if ! id tg-support-bot >/dev/null 2>&1; then
-    useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin tg-support-bot
-  fi
-  RUN_USER=tg-support-bot
-  chown -R "$RUN_USER:$RUN_USER" "$APP_DIR"
-  chmod 600 "$APP_DIR/.env"
-fi
+chown -R 10001:10001 "$APP_DIR/data"
+chmod 600 "$APP_DIR/.env"
+chmod 750 "$APP_DIR/data"
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   cat > /etc/systemd/system/tg-rust-support-bot.service <<UNIT
 [Unit]
-Description=Telegram Support & Feedback Bot
+Description=Telegram Support & Feedback Bot (container)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=$APP_DIR/bot
-Restart=on-failure
+ExecStartPre=-$ENGINE rm --force tg-rust-support-bot
+ExecStart=$ENGINE run --rm --name tg-rust-support-bot --env-file $APP_DIR/.env --volume $APP_DIR/data:/app/data:Z $IMAGE
+ExecStop=-$ENGINE stop --time 20 tg-rust-support-bot
+Restart=always
 RestartSec=5
-User=$RUN_USER
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now tg-rust-support-bot.service
-  echo "Installed and started. Logs: journalctl -u tg-rust-support-bot -f"
+  systemctl enable tg-rust-support-bot.service
+  if systemctl is-active --quiet tg-rust-support-bot.service; then
+    systemctl restart tg-rust-support-bot.service
+  else
+    systemctl start tg-rust-support-bot.service
+  fi
+  echo "Installed using $ENGINE. Logs: journalctl -u tg-rust-support-bot -f"
 else
-  echo "Installed at $APP_DIR/bot; systemd is unavailable. Start with: $APP_DIR/bot"
+  "$ENGINE" rm --force tg-rust-support-bot >/dev/null 2>&1 || true
+  "$ENGINE" run --detach --restart=unless-stopped --name tg-rust-support-bot --env-file "$APP_DIR/.env" --volume "$APP_DIR/data:/app/data:Z" "$IMAGE"
+  echo "Installed using $ENGINE. Container: tg-rust-support-bot"
 fi

@@ -39,14 +39,6 @@ pub async fn thread(db: &SqlitePool, id: i64) -> Option<i32> {
         .flatten()
         .flatten()
 }
-pub async fn set_thread(db: &SqlitePool, id: i64, t: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET thread_id=? WHERE user_id=?")
-        .bind(t)
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
-}
 pub async fn map_add(
     db: &SqlitePool,
     uid: i64,
@@ -66,11 +58,11 @@ pub async fn map_add(
     Ok(())
 }
 pub async fn user_reply(db: &SqlitePool, uid: i64, admin_msg: i32) -> Option<i32> {
-    sqlx::query_scalar("SELECT user_msg_id FROM message_map WHERE user_id=? AND admin_msg_id=? AND direction='in' ORDER BY id DESC LIMIT 1").bind(uid).bind(admin_msg).fetch_optional(db).await.ok().flatten()
+    sqlx::query_scalar("SELECT user_msg_id FROM message_map WHERE user_id=? AND admin_msg_id=? ORDER BY id DESC LIMIT 1").bind(uid).bind(admin_msg).fetch_optional(db).await.ok().flatten()
 }
 pub async fn admin_reply(db: &SqlitePool, user_id: i64, user_msg: i32) -> Option<i32> {
     sqlx::query_scalar(
-        "SELECT admin_msg_id FROM message_map WHERE user_id=? AND user_msg_id=? AND direction='out' ORDER BY id DESC LIMIT 1",
+        "SELECT admin_msg_id FROM message_map WHERE user_id=? AND user_msg_id=? ORDER BY id DESC LIMIT 1",
     )
     .bind(user_id)
     .bind(user_msg)
@@ -131,7 +123,34 @@ mod tests {
                 .await
                 .expect("read default dossier pin status");
         assert!(!is_pinned);
-        set_thread(&db, 1, 123).await.expect("save topic id");
+        sqlx::query("UPDATE users SET thread_id=123 WHERE user_id=1")
+            .execute(&db)
+            .await
+            .expect("save topic id");
         assert_eq!(thread(&db, 1).await, Some(123));
+        sqlx::query("UPDATE users SET topic_closed=1 WHERE user_id=1")
+            .execute(&db)
+            .await
+            .expect("mark topic closed without dropping its mapping");
+        assert_eq!(thread(&db, 1).await, Some(123));
+        sqlx::query("UPDATE users SET thread_id=NULL,topic_creation_pending=1 WHERE user_id=1")
+            .execute(&db)
+            .await
+            .expect("reserve topic creation");
+        let second_reservation = sqlx::query("UPDATE users SET topic_creation_pending=1 WHERE user_id=1 AND thread_id IS NULL AND topic_creation_pending=0")
+            .execute(&db)
+            .await
+            .expect("check topic creation reservation");
+        assert_eq!(second_reservation.rows_affected(), 0);
+        map_add(&db, 1, 10, 20, "in")
+            .await
+            .expect("map user message to support topic");
+        map_add(&db, 1, 11, 21, "out")
+            .await
+            .expect("map support reply to user chat");
+        assert_eq!(user_reply(&db, 1, 20).await, Some(10));
+        assert_eq!(user_reply(&db, 1, 21).await, Some(11));
+        assert_eq!(admin_reply(&db, 1, 10).await, Some(20));
+        assert_eq!(admin_reply(&db, 1, 11).await, Some(21));
     }
 }
