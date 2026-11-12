@@ -372,8 +372,9 @@ async fn update_user_status_message(
                 .await
             {
                 Ok(_) => (id, pinned),
-                Err(error) => {
-                    tracing::warn!(user_id = uid, message_id = id, %error, "could not edit user status message; replacing it");
+                Err(error) if is_message_not_modified(&error.to_string()) => (id, pinned),
+                Err(error) if is_missing_status_message(&error.to_string()) => {
+                    tracing::warn!(user_id = uid, message_id = id, %error, "stored user status message is missing; replacing it");
                     match bot
                         .send_message(ChatId(uid), status_text)
                         .parse_mode(ParseMode::Html)
@@ -381,10 +382,14 @@ async fn update_user_status_message(
                     {
                         Ok(message) => (message.id.0, false),
                         Err(error) => {
-                            tracing::error!(user_id = uid, %error, "could not send user status message");
+                            tracing::error!(user_id = uid, %error, "could not send replacement user status message");
                             return;
                         }
                     }
+                }
+                Err(error) => {
+                    tracing::warn!(user_id = uid, message_id = id, %error, "could not edit user status message; preserving existing message");
+                    return;
                 }
             }
         }
@@ -432,6 +437,15 @@ async fn update_user_status_message(
             }
         }
     }
+}
+
+fn is_message_not_modified(error: &str) -> bool {
+    error.to_lowercase().contains("message is not modified")
+}
+
+fn is_missing_status_message(error: &str) -> bool {
+    let error = error.to_lowercase().replace('_', " ");
+    error.contains("message to edit not found") || error.contains("message id invalid")
 }
 
 pub async fn initialize_user_statuses(bot: &Bot, app: &App) {
